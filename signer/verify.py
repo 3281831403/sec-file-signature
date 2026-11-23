@@ -42,9 +42,17 @@ tolerance 0.
 """
 
 import base64
+import binascii
 import hashlib
 import hmac
 import json
+
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def _is_int(value) -> bool:
+    """True for real integers; booleans are not accepted as integers."""
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def digest_file(data) -> str:
@@ -62,7 +70,18 @@ def digest_file(data) -> str:
     digest is lowercase hexadecimal so it can be compared exactly with the
     bundle digest.
     """
-    raise NotImplementedError
+    if isinstance(data, str):
+        raise TypeError("a text string is not a file body")
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        chunks = (data,)
+    else:
+        chunks = data
+    hasher = hashlib.sha256()
+    for chunk in chunks:
+        if isinstance(chunk, str):
+            raise TypeError("a text string is not a file body")
+        hasher.update(bytes(chunk))
+    return hasher.hexdigest()
 
 
 def parse_bundle(bundle) -> dict:
@@ -87,7 +106,64 @@ def parse_bundle(bundle) -> dict:
     invalid required field, an invalid timestamp object, or a signature that
     is not valid base64.  Do not verify the signature here.
     """
-    raise NotImplementedError
+    if isinstance(bundle, (str, bytes, bytearray)):
+        try:
+            document = json.loads(bundle)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError("malformed JSON bundle") from exc
+    elif isinstance(bundle, dict):
+        document = bundle
+    else:
+        raise ValueError("bundle must be a mapping or JSON document")
+
+    if not isinstance(document, dict):
+        raise ValueError("bundle document must be a JSON object")
+
+    digest = document.get("digest")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(char not in _HEX_DIGITS for char in digest)
+    ):
+        raise ValueError("digest must be 64 lowercase hexadecimal characters")
+
+    signatures = document.get("signatures")
+    if not isinstance(signatures, list) or not signatures:
+        raise ValueError("signatures must be a non-empty list")
+    parsed_signatures = []
+    for entry in signatures:
+        if not isinstance(entry, dict):
+            raise ValueError("each signature entry must be an object")
+        cert_id = entry.get("cert_id")
+        serial = entry.get("serial")
+        signature = entry.get("signature")
+        if not isinstance(cert_id, str) or not cert_id:
+            raise ValueError("cert_id must be a non-empty string")
+        if not isinstance(serial, str) or not serial:
+            raise ValueError("serial must be a non-empty string")
+        if not isinstance(signature, str):
+            raise ValueError("signature must be a base64 string")
+        try:
+            base64.b64decode(signature, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("signature is not valid base64") from exc
+        parsed_signatures.append(
+            {"cert_id": cert_id, "serial": serial, "signature": signature}
+        )
+
+    timestamp = document.get("timestamp")
+    if not isinstance(timestamp, dict):
+        raise ValueError("timestamp must be an object")
+    issued_at = timestamp.get("issued_at")
+    expires_at = timestamp.get("expires_at")
+    if not _is_int(issued_at) or not _is_int(expires_at):
+        raise ValueError("timestamp fields must be integers")
+
+    parsed = dict(document)
+    parsed["digest"] = digest
+    parsed["signatures"] = parsed_signatures
+    parsed["timestamp"] = {"issued_at": issued_at, "expires_at": expires_at}
+    return parsed
 
 
 def verify_one(digest, signature, key) -> bool:
@@ -104,7 +180,26 @@ def verify_one(digest, signature, key) -> bool:
     and returns False rather than raising.  Tolerance is 0: no alternate key,
     truncated tag or non-canonical encoding is accepted.
     """
-    raise NotImplementedError
+    try:
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(char not in _HEX_DIGITS for char in digest)
+        ):
+            return False
+        if not isinstance(signature, str):
+            return False
+        if not isinstance(key, (bytes, bytearray)):
+            return False
+        message = bytes.fromhex(digest)
+        try:
+            tag = base64.b64decode(signature, validate=True)
+        except (binascii.Error, ValueError):
+            return False
+        expected = hmac.new(bytes(key), message, hashlib.sha256).digest()
+        return hmac.compare_digest(tag, expected)
+    except Exception:
+        return False
 
 
 def verify_threshold(bundle, keys, threshold) -> bool:
@@ -125,7 +220,27 @@ def verify_threshold(bundle, keys, threshold) -> bool:
     rejects it as too weak for a trusted policy.  This function does not
     check timestamps or revocation; bundle_batch composes those checks.
     """
-    raise NotImplementedError
+    if not _is_int(threshold) or threshold < 1:
+        return False
+    if not isinstance(bundle, dict) or not isinstance(keys, dict):
+        return False
+    signatures = bundle.get("signatures")
+    if not isinstance(signatures, list):
+        return False
+    digest = bundle.get("digest")
+    valid_signers = set()
+    for entry in signatures:
+        if not isinstance(entry, dict):
+            continue
+        cert_id = entry.get("cert_id")
+        if not isinstance(cert_id, str) or cert_id in valid_signers:
+            continue
+        key = keys.get(cert_id)
+        if key is None:
+            continue
+        if verify_one(digest, entry.get("signature"), key):
+            valid_signers.add(cert_id)
+    return len(valid_signers) >= threshold
 
 
 def check_revocation(cert_id, revoked, now) -> bool:
@@ -146,7 +261,27 @@ def check_revocation(cert_id, revoked, now) -> bool:
     cert_id or a malformed matching record; return True when no matching
     record is in force.
     """
-    raise NotImplementedError
+    if (
+        not isinstance(cert_id, (tuple, list))
+        or len(cert_id) != 2
+        or not isinstance(cert_id[0], str)
+        or not isinstance(cert_id[1], str)
+    ):
+        return False
+    if not _is_int(now):
+        return False
+    name, serial = cert_id
+    for record in revoked or ():
+        if not isinstance(record, dict):
+            continue
+        if record.get("name") != name or record.get("serial") != serial:
+            continue
+        revoked_at = record.get("revoked_at")
+        if not _is_int(revoked_at):
+            return False
+        if revoked_at <= now:
+            return False
+    return True
 
 
 def check_timestamp(bundle, now, policy) -> bool:
@@ -167,7 +302,27 @@ def check_timestamp(bundle, now, policy) -> bool:
     missing or malformed timestamp, a non-positive max_age, or a failed
     bound instead of raising.
     """
-    raise NotImplementedError
+    if not isinstance(bundle, dict) or not isinstance(policy, dict):
+        return False
+    if not _is_int(now):
+        return False
+    max_age = policy.get("max_age")
+    if not _is_int(max_age) or max_age <= 0:
+        return False
+    timestamp = bundle.get("timestamp")
+    if not isinstance(timestamp, dict):
+        return False
+    issued_at = timestamp.get("issued_at")
+    expires_at = timestamp.get("expires_at")
+    if not _is_int(issued_at) or not _is_int(expires_at):
+        return False
+    if issued_at > expires_at:
+        return False
+    if not (issued_at <= now <= expires_at):
+        return False
+    if now - issued_at > max_age:
+        return False
+    return True
 
 
 def validate_policy(policy) -> list[str]:
@@ -188,7 +343,21 @@ def validate_policy(policy) -> list[str]:
     In particular, threshold 1 must be reported, because a package cannot be
     allowed to weaken a multi-signature policy to a single signature.
     """
-    raise NotImplementedError
+    issues = []
+    get = policy.get if isinstance(policy, dict) else lambda key, default=None: default
+
+    threshold = get("threshold")
+    if not _is_int(threshold) or threshold < 2:
+        issues.append("threshold_not_above_one")
+
+    if get("check_revocation") is not True:
+        issues.append("revocation_not_checked")
+
+    max_age = get("max_age")
+    if not _is_int(max_age) or max_age <= 0:
+        issues.append("time_window_not_limited")
+
+    return issues
 
 
 def bundle_batch(bundles, policy, now) -> dict:
@@ -219,4 +388,43 @@ def bundle_batch(bundles, policy, now) -> dict:
 
     ``passed + failed == len(bundles)``.  Do not mutate the inputs.
     """
-    raise NotImplementedError
+    policy_ok = not validate_policy(policy)
+    keys = policy.get("keys", {}) if isinstance(policy, dict) else {}
+    revoked = policy.get("revoked", []) if isinstance(policy, dict) else []
+    threshold = policy.get("threshold") if isinstance(policy, dict) else None
+    revocation_enabled = (
+        isinstance(policy, dict) and policy.get("check_revocation") is True
+    )
+
+    results = []
+    for unit in bundles:
+        ok = False
+        if policy_ok:
+            try:
+                parsed = parse_bundle(unit["bundle"])
+                actual_digest = digest_file(unit["data"])
+                if actual_digest == parsed["digest"]:
+                    if check_timestamp(parsed, now, policy):
+                        if verify_threshold(parsed, keys, threshold):
+                            if revocation_enabled:
+                                issued_at = parsed["timestamp"]["issued_at"]
+                                ok = all(
+                                    check_revocation(
+                                        (entry["cert_id"], entry["serial"]),
+                                        revoked,
+                                        issued_at,
+                                    )
+                                    for entry in parsed["signatures"]
+                                )
+                            else:
+                                ok = True
+            except (ValueError, TypeError, KeyError):
+                ok = False
+        results.append(ok)
+
+    passed = sum(1 for result in results if result)
+    return {
+        "results": results,
+        "passed": passed,
+        "failed": len(results) - passed,
+    }
